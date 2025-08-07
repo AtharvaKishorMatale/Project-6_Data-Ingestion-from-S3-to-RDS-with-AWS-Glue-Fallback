@@ -1,99 +1,92 @@
-#!/usr/bin/env python3
-
 import os
-import zipfile
-import datetime
-import shutil
-import subprocess
-import json
-from pathlib import Path
-from dotenv import load_dotenv
+import pandas as pd
+import boto3
+import pymysql
+from sqlalchemy import create_engine
+from botocore.exceptions import ClientError
 
-# ✅ Load .env file from same directory as this script
-load_dotenv(os.path.expanduser("~/.backup_config.env"))
+# Load from environment
+aws_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+aws_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+aws_region = os.environ.get("AWS_DEFAULT_REGION")
 
-# Load environment variables
-PROJECT_NAME = os.getenv("PROJECT_NAME")
-SOURCE_DIR = os.getenv("SOURCE_DIR")
-BACKUP_DIR = os.getenv("BACKUP_DIR")
-LOG_FILE = os.getenv("LOG_FILE")
+s3_bucket = os.environ.get("S3_BUCKET_NAME")
+csv_key = os.environ.get("CSV_FILE_KEY")
 
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", 7))
-RETENTION_WEEKS = int(os.getenv("RETENTION_WEEKS", 4))
-RETENTION_MONTHS = int(os.getenv("RETENTION_MONTHS", 3))
+rds_host = os.environ.get("RDS_HOST")
+rds_user = os.environ.get("RDS_USER")
+rds_pass = os.environ.get("RDS_PASSWORD")
+rds_db = os.environ.get("RDS_DB_NAME")
+rds_table = os.environ.get("RDS_TABLE_NAME")
 
-RCLONE_REMOTE = os.getenv("RCLONE_REMOTE")
-RCLONE_FOLDER = os.getenv("RCLONE_FOLDER")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-NOTIFY = os.getenv("NOTIFY", "true").lower() == "true"
+glue_db = os.environ.get("GLUE_DB_NAME")
+glue_table = os.environ.get("GLUE_TABLE_NAME")
+glue_s3_path = os.environ.get("GLUE_S3_PATH")
 
-# Timestamp and paths
-now = datetime.datetime.now()
-date_path = now.strftime("%Y/%m/%d")
-timestamp = now.strftime("%Y%m%d_%H%M%S")
-zip_name = f"{PROJECT_NAME}_{timestamp}.zip"
-zip_dir = Path(BACKUP_DIR) / date_path
-zip_path = zip_dir / zip_name
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region,
+)
 
-# Ensure backup directory exists
-os.makedirs(zip_dir, exist_ok=True)
+glue_client = boto3.client(
+    "glue",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region,
+)
 
-# Create zip archive
-print(f"[INFO] Creating backup: {zip_path}")
-with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-    for root, _, files in os.walk(SOURCE_DIR):
-        for file in files:
-            full_path = os.path.join(root, file)
-            arcname = os.path.relpath(full_path, SOURCE_DIR)
-            zipf.write(full_path, arcname)
+def read_csv_from_s3():
+    print(" Reading CSV from S3...")
+    obj = s3_client.get_object(Bucket=s3_bucket, Key=csv_key)
+    return pd.read_csv(obj["Body"])
 
-# Upload to Google Drive using rclone
-upload_cmd = f"rclone copy '{zip_path}' {RCLONE_REMOTE}:{RCLONE_FOLDER}"
-print(f"[INFO] Uploading to Google Drive using rclone...")
-upload_status = subprocess.call(upload_cmd, shell=True)
+def upload_to_rds(df):
+    print("🔗 Uploading data to RDS...")
+    conn_str = f"mysql+pymysql://{rds_user}:{rds_pass}@{rds_host}/{rds_db}"
+    engine = create_engine(conn_str)
+    df.to_sql(name=rds_table, con=engine, if_exists="append", index=False)
+    print(" Data uploaded to RDS.")
 
-# Logging
-status_text = "Success" if upload_status == 0 else "Failed"
-log_entry = f"{now} | Backup: {zip_path.name} | Upload: {status_text}\n"
-with open(LOG_FILE, "a") as log:
-    log.write(log_entry)
+def fallback_to_glue(df):
+    print("⚠ RDS failed. Falling back to Glue...")
 
-# Send notification webhook if enabled and upload was successful
-if NOTIFY and upload_status == 0:
-    payload = {
-        "project": PROJECT_NAME,
-        "date": now.isoformat(),
-        "status": "BackupSuccessful"
-    }
+    columns = [{"Name": col, "Type": "string"} for col in df.columns]
+
     try:
-        subprocess.run([
-            "curl", "-X", "POST",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps(payload),
-            WEBHOOK_URL
-        ])
-        print(f"[INFO] Webhook notification sent.")
+        glue_client.create_table(
+            DatabaseName=glue_db,
+            TableInput={
+                "Name": glue_table,
+                "StorageDescriptor": {
+                    "Columns": columns,
+                    "Location": glue_s3_path,
+                    "InputFormat": "org.apache.hadoop.mapred.TextInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+                    "SerdeInfo": {
+                        "SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+                        "Parameters": {"field.delim": ","}
+                    }
+                },
+                "TableType": "EXTERNAL_TABLE",
+            }
+        )
+        print(" Fallback succeeded: Glue table created.")
+    except ClientError as e:
+        print(f" Glue fallback failed: {e.response['Error']['Message']}")
+
+def main():
+    try:
+        df = read_csv_from_s3()
+        upload_to_rds(df)
     except Exception as e:
-        print(f"[ERROR] Failed to send webhook: {e}")
+        print(f" Error uploading to RDS: {str(e)}")
+        try:
+            df = read_csv_from_s3()
+            fallback_to_glue(df)
+        except Exception as fallback_error:
+            print(f" Fallback to Glue also failed: {str(fallback_error)}")
 
-# Retention cleanup
-def delete_old_files(path, max_days):
-    now_ts = datetime.datetime.now().timestamp()
-    for dirpath, _, files in os.walk(path):
-        for file in files:
-            file_path = Path(dirpath) / file
-            if file_path.suffix != ".zip":
-                continue
-            age_days = (now_ts - file_path.stat().st_mtime) / (3600 * 24)
-            if age_days > max_days:
-                try:
-                    file_path.unlink()
-                    with open(LOG_FILE, "a") as log:
-                        log.write(f"{datetime.datetime.now()} | Deleted: {file_path.name}\n")
-                    print(f"[INFO] Deleted old backup: {file_path}")
-                except Exception as e:
-                    print(f"[ERROR] Could not delete {file_path}: {e}")
-
-# Apply retention policy
-max_age_days = max(RETENTION_DAYS, RETENTION_WEEKS * 7, RETENTION_MONTHS * 30)
-delete_old_files(BACKUP_DIR, max_age_days)
+if __name__ == "__main__":
+    main()
